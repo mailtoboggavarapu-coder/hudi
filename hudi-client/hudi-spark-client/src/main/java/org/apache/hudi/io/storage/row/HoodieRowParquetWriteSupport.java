@@ -81,6 +81,9 @@ import scala.Enumeration;
 import scala.Function1;
 
 import static org.apache.hudi.common.config.HoodieStorageConfig.PARQUET_FIELD_ID_WRITE_ENABLED;
+import static org.apache.hudi.common.config.HoodieStorageConfig.PARQUET_VARIANT_ALLOW_READING_SHREDDED;
+import static org.apache.hudi.common.config.HoodieStorageConfig.PARQUET_VARIANT_FORCE_SHREDDING_SCHEMA_FOR_TEST;
+import static org.apache.hudi.common.config.HoodieStorageConfig.PARQUET_VARIANT_WRITE_SHREDDING_ENABLED;
 import static org.apache.hudi.config.HoodieWriteConfig.ALLOW_OPERATION_METADATA_FIELD;
 import static org.apache.hudi.config.HoodieWriteConfig.AVRO_SCHEMA_STRING;
 import static org.apache.hudi.config.HoodieWriteConfig.INTERNAL_SCHEMA_STRING;
@@ -130,6 +133,8 @@ public class HoodieRowParquetWriteSupport extends WriteSupport<InternalRow> {
    * For non-shredded cases, this is identical to structType.
    */
   private final StructType shreddedSchema;
+  private final boolean variantWriteShreddingEnabled;
+  private final String variantForceShreddingSchemaForTest;
   private RecordConsumer recordConsumer;
 
   public HoodieRowParquetWriteSupport(Configuration conf, StructType structType, Option<BloomFilter> bloomFilterOpt, HoodieConfig config) {
@@ -138,6 +143,16 @@ public class HoodieRowParquetWriteSupport extends WriteSupport<InternalRow> {
     hadoopConf.set("spark.sql.parquet.writeLegacyFormat", writeLegacyFormatEnabled);
     hadoopConf.set("spark.sql.parquet.outputTimestampType", config.getStringOrDefault(HoodieStorageConfig.PARQUET_OUTPUT_TIMESTAMP_TYPE));
     hadoopConf.set("spark.sql.parquet.fieldId.write.enabled", config.getStringOrDefault(PARQUET_FIELD_ID_WRITE_ENABLED));
+
+    // Variant shredding configs
+    this.variantWriteShreddingEnabled = config.getBooleanOrDefault(PARQUET_VARIANT_WRITE_SHREDDING_ENABLED);
+    this.variantForceShreddingSchemaForTest = config.getString(PARQUET_VARIANT_FORCE_SHREDDING_SCHEMA_FOR_TEST);
+    hadoopConf.setBoolean("spark.sql.variant.writeShredding.enabled", variantWriteShreddingEnabled);
+    hadoopConf.setBoolean("spark.sql.variant.allowReadingShredded", config.getBooleanOrDefault(PARQUET_VARIANT_ALLOW_READING_SHREDDED));
+    if (variantForceShreddingSchemaForTest != null && !variantForceShreddingSchemaForTest.isEmpty()) {
+      hadoopConf.set("spark.sql.variant.forceShreddingSchemaForTest", variantForceShreddingSchemaForTest);
+    }
+
     this.writeLegacyListFormat = Boolean.parseBoolean(writeLegacyFormatEnabled)
         || Boolean.parseBoolean(config.getStringOrDefault(AvroWriteSupport.WRITE_OLD_LIST_STRUCTURE, "false"));
     this.structType = structType;
@@ -161,15 +176,34 @@ public class HoodieRowParquetWriteSupport extends WriteSupport<InternalRow> {
   /**
    * Generates a shredded schema from the given structType and hoodieSchema.
    * <p>
-   * For Variant fields that are configured for shredding (based on HoodieSchema.Variant.isShredded()),
-   * the VariantType is replaced with a shredded struct schema. This method recursively processes
-   * nested struct fields to handle Variant fields at any depth.
+   * For Variant fields that are configured for shredding (based on HoodieSchema.Variant.isShredded()), the VariantType is replaced with a shredded struct schema.
+   * <p>
+   * Shredding behavior is controlled by:
+   * <ul>
+   *   <li>{@code hoodie.parquet.variant.write.shredding.enabled} - Master switch for shredding (default: true).
+   *       When false, no shredding happens regardless of schema configuration.</li>
+   *   <li>{@code hoodie.parquet.variant.force.shredding.schema.for.test} - When set, forces this DDL schema
+   *       as the typed_value schema for ALL variant columns, overriding schema-driven shredding.</li>
+   * </ul>
+   *
+   * This method recursively processes nested struct fields to handle Variant fields at any depth.
    *
    * @param structType The original Spark StructType
    * @param hoodieSchema The HoodieSchema containing shredding information
    * @return A StructType with shredded Variant fields replaced by their shredded schemas
    */
   private StructType generateShreddedSchema(StructType structType, HoodieSchema hoodieSchema) {
+    // If write shredding is disabled, skip shredding entirely
+    if (!variantWriteShreddingEnabled) {
+      return structType;
+    }
+
+    // Parse forced shredding schema if configured
+    StructType forcedShreddingSchema = null;
+    if (variantForceShreddingSchemaForTest != null && !variantForceShreddingSchemaForTest.isEmpty()) {
+      forcedShreddingSchema = StructType.fromDDL(variantForceShreddingSchemaForTest);
+    }
+
     StructField[] fields = structType.fields();
     StructField[] shreddedFields = new StructField[fields.length];
     boolean hasShredding = false;
@@ -177,6 +211,16 @@ public class HoodieRowParquetWriteSupport extends WriteSupport<InternalRow> {
     for (int i = 0; i < fields.length; i++) {
       StructField field = fields[i];
       DataType dataType = field.dataType();
+
+      // If a forced shredding schema is configured, use it for all variant columns
+      if (forcedShreddingSchema != null
+          && SparkAdapterSupport$.MODULE$.sparkAdapter().isVariantType(dataType)) {
+        StructType markedShreddedStruct = SparkAdapterSupport$.MODULE$.sparkAdapter()
+            .generateVariantWriteShreddingSchema(forcedShreddingSchema, true, false);
+        shreddedFields[i] = new StructField(field.name(), markedShreddedStruct, field.nullable(), field.metadata());
+        hasShredding = true;
+        continue;
+      }
 
       // Get the HoodieSchema for this field (if available)
       // Use getNonNullType() to unwrap nullable unions (e.g., ["null", "string"] -> "string")
@@ -186,24 +230,22 @@ public class HoodieRowParquetWriteSupport extends WriteSupport<InternalRow> {
           .map(HoodieSchemaField::schema)
           .orElse(null);
 
-      // Check if this is a Variant field that should be shredded
-      if (SparkAdapterSupport$.MODULE$.sparkAdapter().isVariantType(dataType)) {
-        if (fieldHoodieSchema != null && fieldHoodieSchema.getType() == HoodieSchemaType.VARIANT) {
-          HoodieSchema.Variant variantSchema = (HoodieSchema.Variant) fieldHoodieSchema;
-          // If typed_value field exists, the variant is shredded
-          if (variantSchema.getTypedValueField().isPresent()) {
-            // Use plain types for SparkShreddingUtils (unwraps nested {value, typed_value} structs if present)
-            HoodieSchema typedValueSchema = variantSchema.getPlainTypedValueSchema().get();
-            DataType typedValueDataType = HoodieSchemaConversionUtils.convertHoodieSchemaToDataType(typedValueSchema);
+      if (SparkAdapterSupport$.MODULE$.sparkAdapter().isVariantType(dataType)
+          && fieldHoodieSchema != null && fieldHoodieSchema.getType() == HoodieSchemaType.VARIANT) {
+        HoodieSchema.Variant variantSchema = (HoodieSchema.Variant) fieldHoodieSchema;
+        // If typed_value field exists, the variant is shredded
+        if (variantSchema.getTypedValueField().isPresent()) {
+          // Use plain types for SparkShreddingUtils (unwraps nested {value, typed_value} structs if present)
+          HoodieSchema typedValueSchema = variantSchema.getPlainTypedValueSchema().get();
+          DataType typedValueDataType = HoodieSchemaConversionUtils.convertHoodieSchemaToDataType(typedValueSchema);
 
-            // Generate the shredding schema with write metadata using SparkAdapter
-            StructType markedShreddedStruct = SparkAdapterSupport$.MODULE$.sparkAdapter()
-                .generateVariantWriteShreddingSchema(typedValueDataType, true, false);
+          // Generate the shredding schema with write metadata using SparkAdapter
+          StructType markedShreddedStruct = SparkAdapterSupport$.MODULE$.sparkAdapter()
+              .generateVariantWriteShreddingSchema(typedValueDataType, true, false);
 
-            shreddedFields[i] = new StructField(field.name(), markedShreddedStruct, field.nullable(), field.metadata());
-            hasShredding = true;
-            continue;
-          }
+          shreddedFields[i] = new StructField(field.name(), markedShreddedStruct, field.nullable(), field.metadata());
+          hasShredding = true;
+          continue;
         }
       }
 

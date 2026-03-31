@@ -20,15 +20,14 @@
 package org.apache.spark.sql.execution.datasources.parquet
 
 import org.apache.hudi.SparkAdapterSupport
+import org.apache.hudi.common.schema.HoodieSchema
 import org.apache.hudi.common.util.ValidationUtils
-
 import org.apache.parquet.hadoop.api.InitContext
 import org.apache.parquet.hadoop.api.ReadSupport.ReadContext
 import org.apache.parquet.schema.{GroupType, MessageType, PrimitiveType, SchemaRepair, Type, Types}
 import org.apache.spark.sql.catalyst.util.RebaseDateTime.RebaseSpec
 
 import java.time.ZoneId
-
 import scala.collection.JavaConverters._
 
 class HoodieParquetReadSupport(
@@ -98,10 +97,16 @@ object HoodieParquetReadSupport {
   private def reorderVariantType(t: Type): Type = {
     t match {
       case group: GroupType if isVariantGroup(group) =>
-        // Rebuild with [value, metadata] order for Spark compatibility
-        val valueField = group.getType("value")
-        val metadataField = group.getType("metadata")
-        group.withNewFields(java.util.Arrays.asList(valueField, metadataField))
+        // Rebuild with [value, metadata, ...] order for Spark compatibility.
+        // For shredded variants, preserve typed_value after value and metadata.
+        val valueField = group.getType(HoodieSchema.Variant.VARIANT_VALUE_FIELD)
+        val metadataField = group.getType(HoodieSchema.Variant.VARIANT_METADATA_FIELD)
+        if (group.containsField(HoodieSchema.Variant.VARIANT_TYPED_VALUE_FIELD)) {
+          val typedValueField = reorderVariantType(group.getType(HoodieSchema.Variant.VARIANT_TYPED_VALUE_FIELD))
+          group.withNewFields(java.util.Arrays.asList(valueField, metadataField, typedValueField))
+        } else {
+          group.withNewFields(java.util.Arrays.asList(valueField, metadataField))
+        }
       case group: GroupType =>
         // Recurse into nested groups
         val children = group.getFields.asScala.map(reorderVariantType).asJava

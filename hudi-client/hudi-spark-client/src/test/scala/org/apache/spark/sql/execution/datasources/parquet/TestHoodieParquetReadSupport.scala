@@ -134,4 +134,89 @@ class TestHoodieParquetReadSupport {
     val result = HoodieParquetReadSupport.reorderVariantFields(schema)
     Assertions.assertEquals(schema, result)
   }
+
+  @Test
+  def testReorderVariantFields_unshreddedVariantReordered(): Unit = {
+    val schema = Types.buildMessage()
+      .addField(Types.requiredGroup()
+        .addField(Types.required(PrimitiveTypeName.BINARY).named("metadata"))
+        .addField(Types.required(PrimitiveTypeName.BINARY).named("value"))
+        .named("v"))
+      .named("test")
+
+    val result = HoodieParquetReadSupport.reorderVariantFields(schema)
+
+    val expected = Types.buildMessage()
+      .addField(Types.requiredGroup()
+        .addField(Types.required(PrimitiveTypeName.BINARY).named("value"))
+        .addField(Types.required(PrimitiveTypeName.BINARY).named("metadata"))
+        .named("v"))
+      .named("test")
+
+    Assertions.assertEquals(expected, result)
+  }
+
+  @Test
+  def testReorderVariantFields_shreddedScalarVariantPreservesTypedValue(): Unit = {
+    val schema = Types.buildMessage()
+      .addField(Types.requiredGroup()
+        .addField(Types.required(PrimitiveTypeName.BINARY).named("metadata"))
+        .addField(Types.optional(PrimitiveTypeName.BINARY).named("value"))
+        .addField(Types.optional(PrimitiveTypeName.INT64).named("typed_value"))
+        .named("v"))
+      .named("test")
+
+    val result = HoodieParquetReadSupport.reorderVariantFields(schema)
+
+    val expected = Types.buildMessage()
+      .addField(Types.requiredGroup()
+        .addField(Types.optional(PrimitiveTypeName.BINARY).named("value"))
+        .addField(Types.required(PrimitiveTypeName.BINARY).named("metadata"))
+        .addField(Types.optional(PrimitiveTypeName.INT64).named("typed_value"))
+        .named("v"))
+      .named("test")
+
+    Assertions.assertEquals(expected, result)
+  }
+
+  @Test
+  def testReorderVariantFields_shreddedObjectVariantPreservesNestedTypedValue(): Unit = {
+    val schema = Types.buildMessage()
+      .addField(Types.requiredGroup()
+        .addField(Types.required(PrimitiveTypeName.BINARY).named("metadata"))
+        .addField(Types.optional(PrimitiveTypeName.BINARY).named("value"))
+        .addField(Types.optionalGroup()
+          .addField(Types.optionalGroup()
+            .addField(Types.optional(PrimitiveTypeName.BINARY).named("value"))
+            .addField(Types.optional(PrimitiveTypeName.INT32).named("typed_value"))
+            .named("a"))
+          .addField(Types.optionalGroup()
+            .addField(Types.optional(PrimitiveTypeName.BINARY).named("value"))
+            .addField(Types.optional(PrimitiveTypeName.BINARY).named("typed_value"))
+            .named("b"))
+          .named("typed_value"))
+        .named("v"))
+      .named("test")
+
+    val result = HoodieParquetReadSupport.reorderVariantFields(schema)
+
+    val expected = Types.buildMessage()
+      .addField(Types.requiredGroup()
+        .addField(Types.optional(PrimitiveTypeName.BINARY).named("value"))
+        .addField(Types.required(PrimitiveTypeName.BINARY).named("metadata"))
+        .addField(Types.optionalGroup()
+          .addField(Types.optionalGroup()
+            .addField(Types.optional(PrimitiveTypeName.BINARY).named("value"))
+            .addField(Types.optional(PrimitiveTypeName.INT32).named("typed_value"))
+            .named("a"))
+          .addField(Types.optionalGroup()
+            .addField(Types.optional(PrimitiveTypeName.BINARY).named("value"))
+            .addField(Types.optional(PrimitiveTypeName.BINARY).named("typed_value"))
+            .named("b"))
+          .named("typed_value"))
+        .named("v"))
+      .named("test")
+
+    Assertions.assertEquals(expected, result)
+  }
 }

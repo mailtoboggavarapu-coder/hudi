@@ -23,8 +23,8 @@ import org.apache.hudi.HoodieSparkUtils
 import org.apache.hudi.common.testutils.HoodieTestUtils
 import org.apache.hudi.common.util.StringUtils
 import org.apache.hudi.internal.schema.HoodieSchemaException
-
 import org.apache.hadoop.fs.{FileSystem, Path => HadoopPath}
+import org.apache.hudi.testutils.DataSourceTestUtils
 import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.util.HadoopInputFile
 import org.apache.parquet.schema.{GroupType, MessageType, Type}
@@ -539,6 +539,184 @@ class TestVariantDataType extends HoodieSparkSqlTestBase {
       checkAnswer(s"select id, cast(v as string) from $tableName")(
         Seq(1, "{}")
       )
+    })
+  }
+
+  test("Test Variant Compaction on MOR Table (Unshredded)") {
+    assume(HoodieSparkUtils.gteqSpark4_0, "Variant type requires Spark 4.0 or higher")
+
+    withRecordType()(withTempDir { tmp =>
+      val tableName = generateTableName
+      spark.sql(
+        s"""
+           |create table $tableName (
+           |  id int,
+           |  v variant,
+           |  ts long
+           |) using hudi
+           | location '${tmp.getCanonicalPath}'
+           | tblproperties (
+           |  primaryKey = 'id',
+           |  type = 'mor',
+           |  preCombineField = 'ts',
+           |  hoodie.index.type = 'INMEMORY',
+           |  hoodie.compact.inline = 'true'
+           | )
+        """.stripMargin)
+
+      spark.sql("set hoodie.parquet.variant.write.shredding.enabled = false")
+
+      // Build up log-only state with multiple commits
+      spark.sql(s"insert into $tableName values (1, parse_json('{\"a\": 1}'), 1000)")
+      spark.sql(s"insert into $tableName values (2, parse_json('{\"b\": 2}'), 1000)")
+      spark.sql(s"insert into $tableName values (3, parse_json('{\"c\": 3}'), 1000)")
+
+      // Verify log-only state before compaction
+      assertResult(true)(DataSourceTestUtils.isLogFileOnly(tmp.getCanonicalPath))
+
+      // Verify reads work from log files
+      checkAnswer(s"select id, cast(v as string) from $tableName order by id")(
+        Seq(1, "{\"a\":1}"),
+        Seq(2, "{\"b\":2}"),
+        Seq(3, "{\"c\":3}")
+      )
+
+      // Update a record (4th commit)
+      spark.sql(s"update $tableName set v = parse_json('{\"a\": 100, \"updated\": true}'), ts = 2000 where id = 1")
+      assertResult(true)(DataSourceTestUtils.isLogFileOnly(tmp.getCanonicalPath))
+
+      // 5th commit triggers compaction
+      spark.sql(s"insert into $tableName values (4, parse_json('{\"d\": 4}'), 1000)")
+      assertResult(false)(DataSourceTestUtils.isLogFileOnly(tmp.getCanonicalPath))
+
+      // Verify data after compaction
+      checkAnswer(s"select id, cast(v as string) from $tableName order by id")(
+        Seq(1, "{\"a\":100,\"updated\":true}"),
+        Seq(2, "{\"b\":2}"),
+        Seq(3, "{\"c\":3}"),
+        Seq(4, "{\"d\":4}")
+      )
+    })
+  }
+
+  test("Test Variant Compaction on MOR Table (Shredded)") {
+    assume(HoodieSparkUtils.gteqSpark4_0, "Variant type requires Spark 4.0 or higher")
+
+    withRecordType()(withTempDir { tmp =>
+      val tableName = generateTableName
+      spark.sql(
+        s"""
+           |create table $tableName (
+           |  id int,
+           |  v variant,
+           |  ts long
+           |) using hudi
+           | location '${tmp.getCanonicalPath}'
+           | tblproperties (
+           |  primaryKey = 'id',
+           |  type = 'mor',
+           |  preCombineField = 'ts',
+           |  hoodie.index.type = 'INMEMORY',
+           |  hoodie.compact.inline = 'true'
+           | )
+        """.stripMargin)
+
+      spark.sql("set hoodie.parquet.variant.write.shredding.enabled = true")
+      spark.sql("set hoodie.parquet.variant.allow.reading.shredded = true")
+      spark.sql("set hoodie.parquet.variant.force.shredding.schema.for.test = a int, b string")
+
+      // Build up log-only state with multiple commits
+      spark.sql(s"insert into $tableName values (1, parse_json('{\"a\": 1, \"b\": \"first\"}'), 1000)")
+      spark.sql(s"insert into $tableName values (2, parse_json('{\"a\": 2, \"b\": \"second\"}'), 1000)")
+      spark.sql(s"insert into $tableName values (3, parse_json('{\"a\": 3, \"b\": \"third\"}'), 1000)")
+
+      // Verify log-only state before compaction
+      assertResult(true)(DataSourceTestUtils.isLogFileOnly(tmp.getCanonicalPath))
+
+      checkAnswer(s"select id, cast(v as string) from $tableName order by id")(
+        Seq(1, "{\"a\":1,\"b\":\"first\"}"),
+        Seq(2, "{\"a\":2,\"b\":\"second\"}"),
+        Seq(3, "{\"a\":3,\"b\":\"third\"}")
+      )
+
+      // Update a record (4th commit)
+      spark.sql(s"update $tableName set v = parse_json('{\"a\": 999, \"b\": \"updated\"}'), ts = 2000 where id = 1")
+      assertResult(true)(DataSourceTestUtils.isLogFileOnly(tmp.getCanonicalPath))
+
+      // 5th commit triggers compaction
+      spark.sql(s"insert into $tableName values (4, parse_json('{\"a\": 4, \"b\": \"fourth\"}'), 1000)")
+      assertResult(false)(DataSourceTestUtils.isLogFileOnly(tmp.getCanonicalPath))
+
+      // Verify data after compaction
+      checkAnswer(s"select id, cast(v as string) from $tableName order by id")(
+        Seq(1, "{\"a\":999,\"b\":\"updated\"}"),
+        Seq(2, "{\"a\":2,\"b\":\"second\"}"),
+        Seq(3, "{\"a\":3,\"b\":\"third\"}"),
+        Seq(4, "{\"a\":4,\"b\":\"fourth\"}")
+      )
+
+      // Verify post-compaction parquet files have shredded structure
+      val parquetFiles = listDataParquetFiles(tmp.getCanonicalPath)
+      assert(parquetFiles.nonEmpty, "Should have at least one data parquet file after compaction")
+      parquetFiles.foreach { filePath =>
+        val schema = readParquetSchema(filePath)
+        val variantGroup = getFieldAsGroup(schema, "v")
+        assert(groupContainsField(variantGroup, "typed_value"),
+          s"Shredded variant should have typed_value field after compaction. Schema:\n$variantGroup")
+      }
+    })
+  }
+
+  test("Test Variant Compaction with Manual Schedule and Run") {
+    assume(HoodieSparkUtils.gteqSpark4_0, "Variant type requires Spark 4.0 or higher")
+
+    withRecordType()(withTempDir { tmp =>
+      val tableName = generateTableName
+      spark.sql(
+        s"""
+           |create table $tableName (
+           |  id int,
+           |  v variant,
+           |  ts long
+           |) using hudi
+           | location '${tmp.getCanonicalPath}'
+           | tblproperties (
+           |  primaryKey = 'id',
+           |  type = 'mor',
+           |  preCombineField = 'ts'
+           | )
+        """.stripMargin)
+
+      withSQLConf(
+        "hoodie.compact.inline" -> "false",
+        "hoodie.compact.schedule.inline" -> "false",
+        "hoodie.compact.inline.max.delta.commits" -> "1",
+        "hoodie.parquet.variant.write.shredding.enabled" -> "true",
+        "hoodie.parquet.variant.allow.reading.shredded" -> "true",
+        "hoodie.parquet.variant.force.shredding.schema.for.test" -> "a int, b string"
+      ) {
+        spark.sql(s"insert into $tableName values (1, parse_json('{\"a\": 1, \"b\": \"one\"}'), 1000)")
+        spark.sql(s"insert into $tableName values (2, parse_json('{\"a\": 2, \"b\": \"two\"}'), 1000)")
+        spark.sql(s"update $tableName set v = parse_json('{\"a\": 10, \"b\": \"ten\"}'), ts = 2000 where id = 1")
+
+        // Verify pre-compaction reads
+        checkAnswer(s"select id, cast(v as string) from $tableName order by id")(
+          Seq(1, "{\"a\":10,\"b\":\"ten\"}"),
+          Seq(2, "{\"a\":2,\"b\":\"two\"}")
+        )
+
+        // Schedule and run compaction
+        spark.sql(s"schedule compaction on $tableName")
+        val compactionRows = spark.sql(s"show compaction on $tableName limit 10").collect()
+        assertResult(1)(compactionRows.length)
+        spark.sql(s"run compaction on $tableName at ${compactionRows(0).getString(0)}")
+
+        // Verify post-compaction reads
+        checkAnswer(s"select id, cast(v as string) from $tableName order by id")(
+          Seq(1, "{\"a\":10,\"b\":\"ten\"}"),
+          Seq(2, "{\"a\":2,\"b\":\"two\"}")
+        )
+      }
     })
   }
 
